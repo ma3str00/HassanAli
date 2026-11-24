@@ -168,42 +168,31 @@ class ClickHouse:
 
     def data_range(self) -> dict:
         global _clock_ahead_years
-        table = settings.full_table
-        # min/max alone follows the sort key. A scalar subquery in the same SELECT
-        # was re-run across the whole table and the page waited on it.
+        # Plain min/max uses the sort key. toUInt32() and a second filtered scan
+        # both failed on this server and the page then reported the database offline.
         res = self.query(
-            f"SELECT toUInt32(min(start_time)), toUInt32(max(start_time)) FROM {table}",
+            f"SELECT toString(min(start_time)), toString(max(start_time)) FROM {settings.full_table}",
             max_rows=1,
-            timeout=8,
+            timeout=15,
         )
-        if not res.rows or res.rows[0][0] is None or res.rows[0][1] is None:
+        if not res.rows or res.rows[0][0] in (None, "") or res.rows[0][1] in (None, ""):
             raise QueryError("The table has no start_time values.")
         raw_lo, raw_hi = res.rows[0]
-        if _usable(raw_lo) and _usable(raw_hi):
+        try:
+            _clock_ahead_years = 0 if _usable(raw_hi) else _years_ahead(raw_hi)
+            first = _show_time(raw_lo)
+            last = _show_time(raw_hi)
+            last_day = last[:10]
+            complete = len(last) >= 13 and last[11:13] >= "23"
+            last_full = last_day if complete else _prev_day(last_day)
+        except (OSError, OverflowError, ValueError):
             _clock_ahead_years = 0
-            first_v, last_v = raw_lo, raw_hi
-        else:
-            capped = self.query(
-                f"SELECT toUInt32(min(start_time)), toUInt32(max(start_time)) FROM {table} "
-                f"WHERE start_time >= {_SANE_LO} AND start_time < {_SANE_HI}",
-                max_rows=1,
-                timeout=8,
-            )
-            sane_lo, sane_hi = capped.rows[0] if capped.rows else (None, None)
-            if _usable(sane_lo) and _usable(sane_hi):
-                _clock_ahead_years = 0
-                first_v, last_v = sane_lo, sane_hi
-            else:
-                _clock_ahead_years = _years_ahead(raw_hi)
-                first_v, last_v = raw_lo, raw_hi
-        first = _show_time(first_v)
-        last = _show_time(last_v)
-        last_day = last[:10]
-        complete = last[11:13] >= "23"
+            first, last = str(raw_lo), str(raw_hi)
+            last_full = str(raw_hi)[:10]
         return {
             "first": first,
             "last": last,
-            "last_full_day": last_day if complete else _prev_day(last_day),
+            "last_full_day": last_full,
         }
 
 
