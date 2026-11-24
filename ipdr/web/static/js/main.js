@@ -18,7 +18,7 @@ function updatePills() {
   db.className = `pill ${r.error ? "bad" : "ok"}`;
   db.replaceChildren();
   db.insertAdjacentHTML("beforeend", '<span class="dot"></span>');
-  db.append(r.error ? "Database offline" : `Data to ${fmtDay(r.last).replace(/ \d{4}$/, "")}`);
+  db.append(r.error ? "Database offline" : `Data to ${fmtDay(r.last)}`);
   db.title = r.error ? `Database not reachable: ${r.error}` : `Records from ${fmtDay(r.first)} to ${fmtDay(r.last)}`;
 
   const mp = $("#model-pill");

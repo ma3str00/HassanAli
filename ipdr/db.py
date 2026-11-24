@@ -168,18 +168,16 @@ class ClickHouse:
 
     def data_range(self) -> dict:
         global _clock_ahead_years
-        # A few rows are stamped July 2104. max(start_time) follows those, and
-        # subtracting the extra years left the month in July. Partitions name the
-        # real days (11 Oct–10 Nov 2026).
-        covered = self._partition_days()
-        if covered:
+        # max(start_time) is a bad July 2104 stamp. The live rows are ordinary
+        # Unix times from the last month, so read that window instead.
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        now = int(datetime.now(ZoneInfo(settings.timezone)).timestamp())
+        recent = self._window_values(now - 400 * 86400, now + 2 * 86400)
+        if recent:
             _clock_ahead_years = 0
-            first_day, last_day = covered
-            return {
-                "first": f"{first_day} 00:00:00",
-                "last": f"{last_day} 23:59:59",
-                "last_full_day": last_day,
-            }
+            return _range_from_raw(*recent)
         res = self.query(
             f"SELECT toString(min(start_time)), toString(max(start_time)) FROM {settings.full_table}",
             max_rows=1,
@@ -188,59 +186,39 @@ class ClickHouse:
         if not res.rows or res.rows[0][0] in (None, "") or res.rows[0][1] in (None, ""):
             raise QueryError("The table has no start_time values.")
         raw_lo, raw_hi = res.rows[0]
-        try:
-            _clock_ahead_years = 0 if _usable(raw_hi) else _years_ahead(raw_hi)
-            first = _show_time(raw_lo)
-            last = _show_time(raw_hi)
-            last_day = last[:10]
-            complete = len(last) >= 13 and last[11:13] >= "23"
-            last_full = last_day if complete else _prev_day(last_day)
-        except (OSError, OverflowError, ValueError):
-            _clock_ahead_years = 0
-            first, last = str(raw_lo), str(raw_hi)
-            last_full = str(raw_hi)[:10]
-        return {
-            "first": first,
-            "last": last,
-            "last_full_day": last_full,
-        }
+        _clock_ahead_years = 0 if _usable(raw_hi) else _years_ahead(raw_hi)
+        return _range_from_raw(raw_lo, raw_hi)
 
-    def _partition_days(self) -> tuple[str, str] | None:
-        if not re.fullmatch(r"[A-Za-z0-9_]+", settings.ch_database + settings.table):
-            return None
+    def _window_values(self, lo: int, hi: int):
         try:
             res = self.query(
-                "SELECT partition FROM system.parts WHERE active "
-                f"AND database = '{settings.ch_database}' AND table = '{settings.table}' "
-                "GROUP BY partition",
-                max_rows=5000,
+                f"SELECT toString(min(start_time)), toString(max(start_time)) "
+                f"FROM {settings.full_table} "
+                f"WHERE start_time >= {int(lo)} AND start_time < {int(hi)}",
+                max_rows=1,
                 timeout=8,
             )
         except QueryError:
             return None
-        days = sorted(day for row in res.rows if (day := _partition_day(row[0])))
-        if not days:
+        if not res.rows:
             return None
-        return days[0], days[-1]
+        raw_lo, raw_hi = res.rows[0]
+        if raw_lo in (None, "", "0") or raw_hi in (None, "", "0"):
+            return None
+        return raw_lo, raw_hi
 
 
-def _partition_day(value) -> str | None:
-    """YYYYMMDD partition id inside 2010–2030. July 2104 parts are ignored."""
-    from datetime import date
-
-    digits = "".join(ch for ch in str(value) if ch.isdigit())
-    if len(digits) >= 8:
-        year, month, day = int(digits[:4]), int(digits[4:6]), int(digits[6:8])
-    elif len(digits) == 6:
-        year, month, day = int(digits[:4]), int(digits[4:6]), 1
-    else:
-        return None
-    if not 2010 <= year <= 2030:
-        return None
+def _range_from_raw(raw_lo, raw_hi) -> dict:
     try:
-        return date(year, month, day).isoformat()
-    except ValueError:
-        return None
+        first = _show_time(raw_lo)
+        last = _show_time(raw_hi)
+        last_day = last[:10]
+        complete = len(last) >= 13 and last[11:13] >= "23"
+        last_full = last_day if complete else _prev_day(last_day)
+    except (OSError, OverflowError, ValueError):
+        first, last = str(raw_lo), str(raw_hi)
+        last_full = str(raw_hi)[:10]
+    return {"first": first, "last": last, "last_full_day": last_full}
 
 
 def _usable(value) -> bool:
