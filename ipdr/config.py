@@ -34,6 +34,10 @@ class Settings:
 
     store_path: str = os.getenv("IPDR_STORE_PATH", str(ROOT / "data" / "ipdr.sqlite3"))
 
+    # 0.0.0.0 accepts connections on every interface. 127.0.0.1 is this machine only.
+    host: str = os.getenv("IPDR_HOST", "0.0.0.0")
+    port: int = _int("IPDR_PORT", 8000)
+
     timezone: str = "Asia/Karachi"
 
     @property

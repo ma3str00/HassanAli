@@ -756,3 +756,13 @@ def health():
     except QueryError:
         ok_db = False
     return {"database": ok_db, "today": date.today().isoformat()}
+
+
+def main() -> None:
+    import uvicorn
+
+    uvicorn.run("ipdr.main:app", host=settings.host, port=settings.port)
+
+
+if __name__ == "__main__":
+    main()

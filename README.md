@@ -9,10 +9,10 @@ fit the result, the SQL (editable), and on request a short written conclusion. C
 ```
 pip install -r requirements.txt
 copy .env.example .env        (fill in the ClickHouse login; an AI key is optional here)
-python -m uvicorn ipdr.main:app --port 8000
+python -m ipdr.main
 ```
 
-Open http://127.0.0.1:8000, go to **Settings**, choose an AI provider and paste your key.
+That listens on port 8000 on every network interface (0.0.0.0). Open http://127.0.0.1:8000 on this machine, or http://<this-machine-ip>:8000 from another machine. Set IPDR_HOST=127.0.0.1 in .env to keep it local only. Go to **Settings**, choose an AI provider and paste your key.
 
 Tests: `python -m pytest -q` (offline: the AI and, where needed, the database are replaced by fakes).
 
@@ -127,5 +127,6 @@ ipdr/
   web/             the page: index.html, static/css, static/js (ES modules, no build step)
 tests/
 ```
+
 #   I P D R  
  

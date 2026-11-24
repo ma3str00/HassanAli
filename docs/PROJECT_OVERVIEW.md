@@ -287,7 +287,7 @@ Logins and roles; a proper read-only database user; a base map for the location 
 pip install -r requirements.txt
 copy .env.example .env          (database login, default AI provider)
 ssh -N -L 8123:localhost:8123 <database-server>     (tunnel to ClickHouse)
-python -m uvicorn ipdr.main:app --port 8000
+python -m ipdr.main
 ```
 
-Open http://127.0.0.1:8000. Tests: `python -m pytest -q`.
+Listens on port 8000 on every network interface (`0.0.0.0`). Open http://127.0.0.1:8000 on this machine, or http://<this-machine-ip>:8000 from another machine. Tests: `python -m pytest -q`.
