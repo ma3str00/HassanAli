@@ -168,8 +168,18 @@ class ClickHouse:
 
     def data_range(self) -> dict:
         global _clock_ahead_years
-        # Plain min/max uses the sort key. toUInt32() and a second filtered scan
-        # both failed on this server and the page then reported the database offline.
+        # A few rows are stamped July 2104. max(start_time) follows those, and
+        # subtracting the extra years left the month in July. Partitions name the
+        # real days (11 Oct–10 Nov 2026).
+        covered = self._partition_days()
+        if covered:
+            _clock_ahead_years = 0
+            first_day, last_day = covered
+            return {
+                "first": f"{first_day} 00:00:00",
+                "last": f"{last_day} 23:59:59",
+                "last_full_day": last_day,
+            }
         res = self.query(
             f"SELECT toString(min(start_time)), toString(max(start_time)) FROM {settings.full_table}",
             max_rows=1,
@@ -194,6 +204,43 @@ class ClickHouse:
             "last": last,
             "last_full_day": last_full,
         }
+
+    def _partition_days(self) -> tuple[str, str] | None:
+        if not re.fullmatch(r"[A-Za-z0-9_]+", settings.ch_database + settings.table):
+            return None
+        try:
+            res = self.query(
+                "SELECT partition FROM system.parts WHERE active "
+                f"AND database = '{settings.ch_database}' AND table = '{settings.table}' "
+                "GROUP BY partition",
+                max_rows=5000,
+                timeout=8,
+            )
+        except QueryError:
+            return None
+        days = sorted(day for row in res.rows if (day := _partition_day(row[0])))
+        if not days:
+            return None
+        return days[0], days[-1]
+
+
+def _partition_day(value) -> str | None:
+    """YYYYMMDD partition id inside 2010–2030. July 2104 parts are ignored."""
+    from datetime import date
+
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    if len(digits) >= 8:
+        year, month, day = int(digits[:4]), int(digits[4:6]), int(digits[6:8])
+    elif len(digits) == 6:
+        year, month, day = int(digits[:4]), int(digits[4:6]), 1
+    else:
+        return None
+    if not 2010 <= year <= 2030:
+        return None
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return None
 
 
 def _usable(value) -> bool:
