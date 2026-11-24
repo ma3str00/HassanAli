@@ -83,7 +83,12 @@ class ClickHouse:
     def query(self, sql: str, *, max_rows: int | None = None, params: dict | None = None,
               timeout: float | None = None) -> QueryResult:
         started = time.perf_counter()
+        http_timeout = float(timeout or settings.max_exec_seconds + 15)
         http_params = self._settings(max_rows)
+        # Stop on the server before the HTTP client gives up, so a slow query
+        # comes back as a timeout instead of a dropped connection.
+        if timeout is not None:
+            http_params["max_execution_time"] = str(max(1, int(http_timeout) - 10))
         for k, v in (params or {}).items():
             http_params[f"param_{k}"] = str(v)
         try:
@@ -91,8 +96,14 @@ class ClickHouse:
                 settings.ch_url,
                 params=http_params,
                 data=(_prepare_sql(sql).rstrip().rstrip(";") + "\nFORMAT JSONCompact").encode("utf-8"),
-                timeout=timeout or settings.max_exec_seconds + 15,
+                timeout=http_timeout,
             )
+        except requests.ConnectTimeout as e:
+            raise QueryError(f"Cannot reach the database: {e.__class__.__name__}") from e
+        except requests.ReadTimeout as e:
+            raise QueryError(
+                "The query was stopped because it ran too long. The database is up; this query is too heavy."
+            ) from e
         except requests.RequestException as e:
             raise QueryError(f"Cannot reach the database: {e.__class__.__name__}") from e
         elapsed = time.perf_counter() - started
@@ -138,6 +149,12 @@ class ClickHouse:
                 data=(_prepare_sql(sql).rstrip().rstrip(";") + "\nFORMAT CSVWithNames").encode("utf-8"),
                 timeout=settings.max_exec_seconds + 15,
             )
+        except requests.ConnectTimeout as e:
+            raise QueryError(f"Cannot reach the database: {e.__class__.__name__}") from e
+        except requests.ReadTimeout as e:
+            raise QueryError(
+                "The query was stopped because it ran too long. The database is up; this query is too heavy."
+            ) from e
         except requests.RequestException as e:
             raise QueryError(f"Cannot reach the database: {e.__class__.__name__}") from e
         if resp.status_code != 200:

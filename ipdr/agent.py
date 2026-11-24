@@ -66,7 +66,7 @@ def _tool_find_values(column: str, search: str, data_range: dict) -> str:
           AND start_time <  toUnixTimestamp('{day} 00:00:00', '{settings.timezone}') + 86400
           AND {column} != '' AND {column} ILIKE {{pattern:String}}
         GROUP BY value ORDER BY rows DESC LIMIT 25"""
-    res = db.cached_query(sql, max_rows=25, params={"pattern": pattern}, ttl=1800)
+    res = db.cached_query(sql, max_rows=25, params={"pattern": pattern}, ttl=1800, timeout=_QUERY_TIMEOUT)
     if not res.rows and phone:
         return (f"{phone[0][0]} has no records on {day}, the only day searched here. It may have records on other "
                 f"days: query the question's period with {context.phone_sql(phone)} and answer from that.")
@@ -122,7 +122,7 @@ def _find_elsewhere(column: str, search: str, day: str, allowed: list[str]) -> s
 def _tool_run_sql(sql: str) -> str:
     fixed = repair_measures(sql)
     checked = sql_guard.check(fixed or sql, max_rows=1000)
-    res = db.cached_query(checked, max_rows=1000)
+    res = db.cached_query(checked, max_rows=1000, timeout=_QUERY_TIMEOUT)
     preview = {
         "columns": [f"{c['name']} {c['type']}" for c in res.columns],
         "row_count": len(res.rows),
@@ -161,6 +161,13 @@ def _describe(call: ToolCall) -> str:
     if call.name == "run_sql":
         return "Testing the query"
     return "Working"
+
+
+_QUERY_TIMEOUT = 90
+
+def _too_heavy(err) -> bool:
+    text = str(err).lower()
+    return "too heavy" in text or "too long" in text or "timeout" in text
 
 
 _JSON_BLOCK = re.compile(r"\{.*\}", re.S)
@@ -648,7 +655,7 @@ def _default_overview(question: str, data_range: dict, steps: list, usage: dict,
     say("Showing an overview: the most used apps")
     try:
         checked = sql_guard.check(sql)
-        result = db.cached_query(checked)
+        result = db.cached_query(checked, timeout=_QUERY_TIMEOUT)
     except (sql_guard.GuardError, QueryError):
         return None
     if not result.rows:
@@ -783,7 +790,7 @@ def _from_cache(key: str, question: str, step: StepFn) -> Answer | None:
     step(steps[0])
     try:
         checked = sql_guard.check(plan["sql"])
-        result = db.cached_query(checked)
+        result = db.cached_query(checked, timeout=_QUERY_TIMEOUT)
     except (sql_guard.GuardError, QueryError):
         store.forget_answer(key)
         return None
@@ -872,6 +879,7 @@ def _answer(question: str, turns: list[dict], cfg: LLMConfig, data_range: dict,
 
     review_turn = None
     failures: dict[str, int] = {}
+    heavy = 0
     ran = None
     for turn_no in range(max_turns):
         if cancel.is_set():
@@ -917,6 +925,13 @@ def _answer(question: str, turns: list[dict], cfg: LLMConfig, data_range: dict,
                     tested_sql.add(_norm_sql(str(c.args.get("sql", ""))))
                 if err:
                     _debug(question, turn=turn_no, tool_error=c.name, message=str(text)[:400])
+                    if _too_heavy(text):
+                        heavy += 1
+            if heavy >= 2:
+                raise AgentError(
+                    "The query was stopped because it ran too long. The database is up. "
+                    "Ask for a shorter period or a simpler breakdown."
+                )
 
         plan_raw = None
         submit_call = None
@@ -1045,18 +1060,29 @@ def _answer(question: str, turns: list[dict], cfg: LLMConfig, data_range: dict,
                 try:
                     checked = sql_guard.check(plan["sql"])
                     say("Running the final query")
-                    result = db.cached_query(checked)
+                    result = db.cached_query(checked, timeout=_QUERY_TIMEOUT)
                 except (sql_guard.GuardError, QueryError) as e:
                     say("Fixing the query")
-                    failed_key = _norm_sql(plan["sql"])
-                    failures[failed_key] = failures.get(failed_key, 0) + 1
-                    if failures[failed_key] > 1:
-                        feedback = (f"Not accepted. You submitted the SAME SQL again and it fails the same way: {e}. "
-                                    "Do not resend it. Write a simpler query: no subquery unless it is needed, and select "
-                                    "the table's columns directly (a column renamed inside a subquery is only known by "
-                                    "its new name outside it). Test it with run_sql, then submit.")
+                    if _too_heavy(e):
+                        heavy += 1
+                        if heavy >= 2:
+                            raise AgentError(
+                                "The query was stopped because it ran too long. The database is up. "
+                                "Ask for a shorter period or a simpler breakdown."
+                            )
+                        feedback = ("Not accepted. The query was stopped because it ran too long. The database is up. "
+                                    "Keep the same start_time range, use one GROUP BY, no subquery, and LIMIT 10. "
+                                    "Test that simpler query with run_sql, then submit it.")
                     else:
-                        feedback = f"Not accepted. The SQL failed when run: {e}. Fix it, test it with run_sql, then submit again."
+                        failed_key = _norm_sql(plan["sql"])
+                        failures[failed_key] = failures.get(failed_key, 0) + 1
+                        if failures[failed_key] > 1:
+                            feedback = (f"Not accepted. You submitted the SAME SQL again and it fails the same way: {e}. "
+                                        "Do not resend it. Write a simpler query: no subquery unless it is needed, and select "
+                                        "the table's columns directly (a column renamed inside a subquery is only known by "
+                                        "its new name outside it). Test it with run_sql, then submit.")
+                        else:
+                            feedback = f"Not accepted. The SQL failed when run: {e}. Fix it, test it with run_sql, then submit again."
                 else:
                     key = _norm_sql(plan["sql"])
                     empty_col = uses_empty_column(plan["sql"])
@@ -1290,7 +1316,7 @@ def profile_fallback(question: str, turns: list[dict] | None, data_range: dict):
            f"  AND start_time <  toUnixTimestamp('{(end + timedelta(days=1)).isoformat()} 00:00:00', '{tz}')\n"
            f"  AND subscriber_id IN ({id_list})\nGROUP BY subscriber_id")
     checked = sql_guard.check(sql)
-    result = db.cached_query(checked)
+    result = db.cached_query(checked, timeout=_QUERY_TIMEOUT)
     if not result.rows:
         return None
     plan = {"understood": f"Stored details of the {len(ids)} subscriber(s) from the earlier answer, {_fmt_period(start, end)}.",
@@ -1332,7 +1358,7 @@ def identifier_fallback(question: str, turns: list[dict] | None, data_range: dic
     else:
         return None
     checked = sql_guard.check(sql)
-    result = db.cached_query(checked)
+    result = db.cached_query(checked, timeout=_QUERY_TIMEOUT)
     if not result.rows:
         return None
     plan = {"understood": f"{title}, {_fmt_period(start, end)}.", "status": "ok", "title": title, "sql": sql,
@@ -1391,7 +1417,7 @@ def _answer_with_fallback(fallback, model_plan: dict, steps: list, usage: dict, 
     say(f"Answering with the standard {'count' if total else 'ranking'} of {name} apps")
     try:
         checked = sql_guard.check(sql)
-        result = db.cached_query(checked)
+        result = db.cached_query(checked, timeout=_QUERY_TIMEOUT)
     except (sql_guard.GuardError, QueryError):
         return None
     if not result.rows:
