@@ -169,25 +169,33 @@ class ClickHouse:
     def data_range(self) -> dict:
         global _clock_ahead_years
         table = settings.full_table
-        window = f"start_time >= {_SANE_LO} AND start_time < {_SANE_HI}"
+        # min/max alone follows the sort key. A scalar subquery in the same SELECT
+        # was re-run across the whole table and the page waited on it.
         res = self.query(
-            "SELECT "
-            f"(SELECT toUInt32(min(start_time)) FROM {table} WHERE {window}), "
-            f"(SELECT toUInt32(max(start_time)) FROM {table} WHERE {window}), "
-            f"toUInt32(min(start_time)), toUInt32(max(start_time)) "
-            f"FROM {table}",
+            f"SELECT toUInt32(min(start_time)), toUInt32(max(start_time)) FROM {table}",
             max_rows=1,
-            timeout=30,
+            timeout=8,
         )
-        if not res.rows or res.rows[0][2] is None or res.rows[0][3] is None:
+        if not res.rows or res.rows[0][0] is None or res.rows[0][1] is None:
             raise QueryError("The table has no start_time values.")
-        sane_lo, sane_hi, raw_lo, raw_hi = res.rows[0]
-        if _usable(sane_lo) and _usable(sane_hi):
+        raw_lo, raw_hi = res.rows[0]
+        if _usable(raw_lo) and _usable(raw_hi):
             _clock_ahead_years = 0
-            first_v, last_v = sane_lo, sane_hi
-        else:
-            _clock_ahead_years = _years_ahead(raw_hi)
             first_v, last_v = raw_lo, raw_hi
+        else:
+            capped = self.query(
+                f"SELECT toUInt32(min(start_time)), toUInt32(max(start_time)) FROM {table} "
+                f"WHERE start_time >= {_SANE_LO} AND start_time < {_SANE_HI}",
+                max_rows=1,
+                timeout=8,
+            )
+            sane_lo, sane_hi = capped.rows[0] if capped.rows else (None, None)
+            if _usable(sane_lo) and _usable(sane_hi):
+                _clock_ahead_years = 0
+                first_v, last_v = sane_lo, sane_hi
+            else:
+                _clock_ahead_years = _years_ahead(raw_hi)
+                first_v, last_v = raw_lo, raw_hi
         first = _show_time(first_v)
         last = _show_time(last_v)
         last_day = last[:10]

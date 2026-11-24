@@ -74,11 +74,11 @@ function initSidebar() {
 async function start() {
   initTheme();
   initSidebar();
-  await loadMeta();
   initChat();
   onSettingsSaved((quiet) => { updatePills(); refreshVoice(); if (!quiet) toast("Settings saved"); });
   window.addEventListener("hashchange", route);
   route();
+  await loadMeta();
   setInterval(async () => {
     try {
       const m = await api.meta();

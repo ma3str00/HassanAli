@@ -113,7 +113,7 @@ def index():
 def meta():
     try:
         rng = data_range()
-    except QueryError as e:
+    except Exception as e:
         rng = {"error": str(e)}
     return {
         "data_range": rng,
