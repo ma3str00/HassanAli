@@ -17,6 +17,15 @@ class QueryError(Exception):
 
 _cache: OrderedDict = OrderedDict()
 _cache_lock = threading.Lock()
+# Stored clocks sometimes run decades ahead (a max of July 2104). Rows inside
+# 2010–2030 are used as the real range. If nothing is in that window, displayed
+# dates are shifted back and this many years are added again before a query runs.
+_clock_ahead_years = 0
+_SANE_LO = 1262304000  # 2010-01-01 UTC
+_SANE_HI = 1924992000  # 2031-01-01 UTC
+_TS_LITERAL = re.compile(
+    r"(toUnixTimestamp\(\s*')(\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?)(')"
+)
 
 
 @dataclass
@@ -84,7 +93,7 @@ class ClickHouse:
             resp = self.session.post(
                 settings.ch_url,
                 params=http_params,
-                data=(sql.rstrip().rstrip(";") + "\nFORMAT JSONCompact").encode("utf-8"),
+                data=(_prepare_sql(sql).rstrip().rstrip(";") + "\nFORMAT JSONCompact").encode("utf-8"),
                 timeout=timeout or settings.max_exec_seconds + 15,
             )
         except requests.RequestException as e:
@@ -129,7 +138,7 @@ class ClickHouse:
         try:
             resp = self.session.post(
                 settings.ch_url, params=http_params, stream=True,
-                data=(sql.rstrip().rstrip(";") + "\nFORMAT CSVWithNames").encode("utf-8"),
+                data=(_prepare_sql(sql).rstrip().rstrip(";") + "\nFORMAT CSVWithNames").encode("utf-8"),
                 timeout=settings.max_exec_seconds + 15,
             )
         except requests.RequestException as e:
@@ -158,17 +167,29 @@ class ClickHouse:
         return sum(int(r[i]) for r in res.rows)
 
     def data_range(self) -> dict:
-        # Convert the Unix seconds here. toDateTime(start_time, 'Asia/Karachi') on this
-        # ClickHouse version turns a normal timestamp into a date around year 2104.
+        global _clock_ahead_years
+        table = settings.full_table
+        window = f"start_time >= {_SANE_LO} AND start_time < {_SANE_HI}"
         res = self.query(
-            f"SELECT min(start_time), max(start_time) FROM {settings.full_table}",
+            "SELECT "
+            f"(SELECT toUInt32(min(start_time)) FROM {table} WHERE {window}), "
+            f"(SELECT toUInt32(max(start_time)) FROM {table} WHERE {window}), "
+            f"toUInt32(min(start_time)), toUInt32(max(start_time)) "
+            f"FROM {table}",
             max_rows=1,
-            timeout=20,
+            timeout=30,
         )
-        if not res.rows or res.rows[0][0] is None or res.rows[0][1] is None:
+        if not res.rows or res.rows[0][2] is None or res.rows[0][3] is None:
             raise QueryError("The table has no start_time values.")
-        first = _as_karachi(res.rows[0][0]).strftime("%Y-%m-%d %H:%M:%S")
-        last = _as_karachi(res.rows[0][1]).strftime("%Y-%m-%d %H:%M:%S")
+        sane_lo, sane_hi, raw_lo, raw_hi = res.rows[0]
+        if _usable(sane_lo) and _usable(sane_hi):
+            _clock_ahead_years = 0
+            first_v, last_v = sane_lo, sane_hi
+        else:
+            _clock_ahead_years = _years_ahead(raw_hi)
+            first_v, last_v = raw_lo, raw_hi
+        first = _show_time(first_v)
+        last = _show_time(last_v)
         last_day = last[:10]
         complete = last[11:13] >= "23"
         return {
@@ -176,6 +197,62 @@ class ClickHouse:
             "last": last,
             "last_full_day": last_day if complete else _prev_day(last_day),
         }
+
+
+def _usable(value) -> bool:
+    if value is None:
+        return False
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return False
+    return _SANE_LO <= number < _SANE_HI
+
+
+def _years_ahead(value) -> int:
+    """How many years to subtract so a far-future clock lands on or before today."""
+    from datetime import date
+
+    seen = _as_karachi(value)
+    today = date.today()
+    if seen.year <= today.year + 1:
+        return 0
+    years = seen.year - today.year
+    shifted = _add_years(seen, -years)
+    if shifted.date() > today:
+        years += 1
+    return years
+
+
+def _show_time(value) -> str:
+    return _add_years(_as_karachi(value), -_clock_ahead_years).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _add_years(moment, years: int):
+    if not years:
+        return moment
+    try:
+        return moment.replace(year=moment.year + years)
+    except ValueError:
+        return moment.replace(year=moment.year + years, day=28)
+
+
+def _prepare_sql(sql: str) -> str:
+    if not _clock_ahead_years:
+        return sql
+
+    def repl(match):
+        raw = match.group(2).replace("T", " ")
+        from datetime import datetime
+        if len(raw) == 10:
+            moment = datetime.strptime(raw, "%Y-%m-%d")
+            shown = _add_years(moment, _clock_ahead_years).strftime("%Y-%m-%d")
+        else:
+            moment = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
+            shown = _add_years(moment, _clock_ahead_years).strftime("%Y-%m-%d %H:%M:%S")
+        return match.group(1) + shown + match.group(3)
+
+    return _TS_LITERAL.sub(repl, sql)
 
 
 def _as_karachi(value):
