@@ -72,7 +72,6 @@ class ClickHouse:
             "result_overflow_mode": "break",
             "output_format_json_quote_64bit_integers": "0",
             "output_format_json_quote_denormals": "0",
-            "session_timezone": settings.timezone,
         }
 
     def query(self, sql: str, *, max_rows: int | None = None, params: dict | None = None,
