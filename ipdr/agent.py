@@ -731,6 +731,98 @@ def cache_key(question: str, data_range: dict) -> str:
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
+def _plain_app_limit(question: str) -> int | None:
+    q = question.lower()
+    if not re.search(r"\b(apps?|applications?)\b", q) or not re.search(r"\b(top|most|popular)\b", q):
+        return None
+    if re.search(r"\b(subscriber|website|server|isp|operator|category|imei|imsi|compare|versus|"
+                 r"per user|by city|by hour|by day|by isp|each city)\b", q):
+        return None
+    if concepts.apps_in(q) or concepts.match(q):
+        return None
+    m = re.search(r"\btop\s+(\d+)\b", q)
+    return max(1, min(int(m.group(1)) if m else 10, 50))
+
+
+def _app_rank_window(question: str, data_range: dict):
+    """Start and end timestamp literals for a plain app ranking, or None."""
+    from datetime import datetime, timedelta
+
+    q = question.lower()
+    hour = re.search(r"\b(?:last|past|previous)\s+(\d+)\s*(?:hours?|hrs?)\b", q)
+    if hour or re.search(r"\b(?:last|past)\s+hour\b", q):
+        n = int(hour.group(1)) if hour else 1
+        if not 1 <= n <= 48:
+            return None
+        try:
+            end = datetime.fromisoformat(str(data_range.get("last") or "")[:19])
+        except ValueError:
+            return None
+        start = end - timedelta(hours=n)
+        label = f"the last {n} hour" + ("s" if n != 1 else "")
+        return start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S"), label, True
+    days = re.search(r"\b(?:last|past)\s+(\d+)\s*days?\b", q)
+    found = None if days else question_period(question, data_range)
+    if days:
+        n = int(days.group(1))
+        if not 1 <= n <= 31:
+            return None
+        try:
+            end_day = date.fromisoformat(data_range["last_full_day"])
+        except (KeyError, ValueError, TypeError):
+            return None
+        start_day = end_day - timedelta(days=n - 1)
+        return (f"{start_day.isoformat()} 00:00:00",
+                f"{(end_day + timedelta(days=1)).isoformat()} 00:00:00",
+                _fmt_period(start_day, end_day), False)
+    if not found:
+        return None
+    _label, start_day, end_day = found
+    return (f"{start_day.isoformat()} 00:00:00",
+            f"{(end_day + timedelta(days=1)).isoformat()} 00:00:00",
+            _fmt_period(start_day, end_day), False)
+
+
+def _direct_app_ranking(question: str, data_range: dict, step: StepFn) -> Answer | None:
+    limit = _plain_app_limit(question)
+    window = _app_rank_window(question, data_range) if limit else None
+    if not window:
+        return None
+    start, end, label, hours = window
+    city = concepts.city_in(question)
+    generic = dictionary.base().get("value_lists", {}).get("generic_labels", {}).get("list", [])
+    not_generic = ("\n  AND app_label NOT IN (" + ", ".join("'" + g.replace("'", "\\'") + "'" for g in generic) + ")"
+                   if generic else "")
+    where_city = f"\n  AND client_location = '{city} Pakistan'" if city else ""
+    upper = "<=" if hours else "<"
+    tz = settings.timezone
+    sql = (f"SELECT app_label AS app,\n"
+           f"       uniqExactIf(subscriber_id, position(subscriber_id, '_') = 0) AS users,\n"
+           f"       count() AS connections,\n"
+           f"       round(sum(c2s_byte_num + s2c_byte_num) / 1e9, 2) AS volume_gb\n"
+           f"FROM {settings.full_table}\n"
+           f"WHERE start_time >= toUnixTimestamp('{start}', '{tz}')\n"
+           f"  AND start_time {upper} toUnixTimestamp('{end}', '{tz}')"
+           f"{where_city}{not_generic}\n"
+           f"GROUP BY app\nORDER BY users DESC, connections DESC\nLIMIT {limit}")
+    step("Reading the question")
+    step("Running the query")
+    try:
+        checked = sql_guard.check(sql)
+        result = db.cached_query(checked, timeout=180)
+    except (sql_guard.GuardError, QueryError) as e:
+        raise AgentError(str(e)) from e
+    where = f" in {city}" if city else ""
+    plan = {"understood": f"Top {limit} apps{where}, {label}.",
+            "status": "ok", "title": f"Top {limit} apps{where}", "sql": sql,
+            "explanation": f"Ranked by identified users over {label}.",
+            "assumptions": [{"label": "Measure", "value": "Identified users, then connections"},
+                            {"label": "Excluded", "value": "background traffic"}],
+            "chart": {"type": "bar", "x": "app", "y": "users", "series": ""}, "message": ""}
+    return Answer(plan=align_period_text(plan, sql), sql=checked, result=result,
+                  steps=["Reading the question", "Running the query"], tested=True)
+
+
 def answer(question: str, turns: list[dict], cfg: LLMConfig, data_range: dict,
            step: StepFn, cancel: threading.Event | None = None) -> Answer:
     question = urdu.with_latin(question)
@@ -758,6 +850,10 @@ def answer(question: str, turns: list[dict], cfg: LLMConfig, data_range: dict,
         hit = _from_cache(key, question, step)
         if hit is not None:
             return hit
+    if not turns:
+        direct = _direct_app_ranking(question, data_range, step)
+        if direct is not None:
+            return direct
     ans = _answer(question, turns, cfg, data_range, step, cancel)
     ans.plan = _safe(note_partial_days, ans.plan, ans.result, data_range) or ans.plan
     understood = (ans.plan.get("understood") or "").strip()
