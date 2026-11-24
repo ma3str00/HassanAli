@@ -158,14 +158,17 @@ class ClickHouse:
         return sum(int(r[i]) for r in res.rows)
 
     def data_range(self) -> dict:
+        # Convert the Unix seconds here. toDateTime(start_time, 'Asia/Karachi') on this
+        # ClickHouse version turns a normal timestamp into a date around year 2104.
         res = self.query(
-            f"SELECT toString(toDateTime(min(start_time), '{settings.timezone}')),"
-            f" toString(toDateTime(max(start_time), '{settings.timezone}'))"
-            f" FROM {settings.full_table}",
+            f"SELECT min(start_time), max(start_time) FROM {settings.full_table}",
             max_rows=1,
             timeout=20,
         )
-        first, last = res.rows[0]
+        if not res.rows or res.rows[0][0] is None or res.rows[0][1] is None:
+            raise QueryError("The table has no start_time values.")
+        first = _as_karachi(res.rows[0][0]).strftime("%Y-%m-%d %H:%M:%S")
+        last = _as_karachi(res.rows[0][1]).strftime("%Y-%m-%d %H:%M:%S")
         last_day = last[:10]
         complete = last[11:13] >= "23"
         return {
@@ -173,6 +176,16 @@ class ClickHouse:
             "last": last,
             "last_full_day": last_day if complete else _prev_day(last_day),
         }
+
+
+def _as_karachi(value):
+    """Unix seconds (UTC) as a Pakistan-local datetime."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    if isinstance(value, str) and len(value) >= 10 and value[4] == "-":
+        return datetime.fromisoformat(value[:19])
+    return datetime.fromtimestamp(int(value), ZoneInfo(settings.timezone))
 
 
 def _prev_day(day: str) -> str:
