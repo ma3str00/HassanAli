@@ -17,12 +17,9 @@ class QueryError(Exception):
 
 _cache: OrderedDict = OrderedDict()
 _cache_lock = threading.Lock()
-# Stored clocks sometimes run decades ahead (a max of July 2104). Rows inside
-# 2010–2030 are used as the real range. If nothing is in that window, displayed
-# dates are shifted back and this many years are added again before a query runs.
+# One stored stamp is July 2104. Dates are taken from the last 45 days instead
+# of shifting that stamp. Left at 0 so query timestamps are not rewritten.
 _clock_ahead_years = 0
-_SANE_LO = 1262304000  # 2010-01-01 UTC
-_SANE_HI = 1924992000  # 2031-01-01 UTC
 _TS_LITERAL = re.compile(
     r"(toUnixTimestamp\(\s*')(\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?)(')"
 )
@@ -168,44 +165,39 @@ class ClickHouse:
 
     def data_range(self) -> dict:
         global _clock_ahead_years
-        # max(start_time) is a bad July 2104 stamp. The live rows are ordinary
-        # Unix times from the last month, so read that window instead.
+        # max(start_time) is one bad July 2104 value, and shifting that year
+        # still lands on 16 July. The table is sorted by start_time, so the
+        # newest real row is the last key in the recent window, not the max.
         from datetime import datetime
         from zoneinfo import ZoneInfo
 
         now = int(datetime.now(ZoneInfo(settings.timezone)).timestamp())
-        recent = self._window_values(now - 400 * 86400, now + 2 * 86400)
-        if recent:
-            _clock_ahead_years = 0
-            return _range_from_raw(*recent)
-        res = self.query(
-            f"SELECT toString(min(start_time)), toString(max(start_time)) FROM {settings.full_table}",
-            max_rows=1,
-            timeout=15,
-        )
-        if not res.rows or res.rows[0][0] in (None, "") or res.rows[0][1] in (None, ""):
-            raise QueryError("The table has no start_time values.")
-        raw_lo, raw_hi = res.rows[0]
-        _clock_ahead_years = 0 if _usable(raw_hi) else _years_ahead(raw_hi)
-        return _range_from_raw(raw_lo, raw_hi)
+        lo_bound = now - 45 * 86400
+        hi_bound = now + 2 * 86400
+        newest = self._edge(lo_bound, hi_bound, desc=True)
+        if newest is None:
+            raise QueryError(
+                "No start_time in the last 45 days. The July 2104 stamp was ignored."
+            )
+        oldest = self._edge(lo_bound, hi_bound, desc=False) or newest
+        _clock_ahead_years = 0
+        return _range_from_raw(oldest, newest)
 
-    def _window_values(self, lo: int, hi: int):
+    def _edge(self, lo: int, hi: int, *, desc: bool):
+        order = "DESC" if desc else "ASC"
         try:
             res = self.query(
-                f"SELECT toString(min(start_time)), toString(max(start_time)) "
-                f"FROM {settings.full_table} "
-                f"WHERE start_time >= {int(lo)} AND start_time < {int(hi)}",
+                f"SELECT toString(start_time) FROM {settings.full_table} "
+                f"WHERE start_time >= {int(lo)} AND start_time < {int(hi)} "
+                f"ORDER BY start_time {order} LIMIT 1",
                 max_rows=1,
-                timeout=8,
+                timeout=20,
             )
         except QueryError:
             return None
-        if not res.rows:
+        if not res.rows or res.rows[0][0] in (None, "", "0"):
             return None
-        raw_lo, raw_hi = res.rows[0]
-        if raw_lo in (None, "", "0") or raw_hi in (None, "", "0"):
-            return None
-        return raw_lo, raw_hi
+        return res.rows[0][0]
 
 
 def _range_from_raw(raw_lo, raw_hi) -> dict:
@@ -219,31 +211,6 @@ def _range_from_raw(raw_lo, raw_hi) -> dict:
         first, last = str(raw_lo), str(raw_hi)
         last_full = str(raw_hi)[:10]
     return {"first": first, "last": last, "last_full_day": last_full}
-
-
-def _usable(value) -> bool:
-    if value is None:
-        return False
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return False
-    return _SANE_LO <= number < _SANE_HI
-
-
-def _years_ahead(value) -> int:
-    """How many years to subtract so a far-future clock lands on or before today."""
-    from datetime import date
-
-    seen = _as_karachi(value)
-    today = date.today()
-    if seen.year <= today.year + 1:
-        return 0
-    years = seen.year - today.year
-    shifted = _add_years(seen, -years)
-    if shifted.date() > today:
-        years += 1
-    return years
 
 
 def _show_time(value) -> str:
