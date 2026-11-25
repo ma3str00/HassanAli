@@ -120,7 +120,8 @@ def _find_elsewhere(column: str, search: str, day: str, allowed: list[str]) -> s
 
 
 def _tool_run_sql(sql: str) -> str:
-    fixed = repair_measures(sql)
+    repaired = repair_measures(sql)
+    fixed = fix_user_count(repaired or sql) or repaired
     checked = sql_guard.check(fixed or sql, max_rows=1000)
     res = db.cached_query(checked, max_rows=1000, timeout=_QUERY_TIMEOUT)
     preview = {
@@ -133,8 +134,8 @@ def _tool_run_sql(sql: str) -> str:
     }
     if not res.rows:
         preview["note"] = "No rows. Check the names (find_values), the period and the filters."
-    if fixed:
-        preview["fixed_sql"] = fixed
+    if repaired:
+        preview["fixed_sql"] = fixed or repaired
         preview["note_on_measures"] = ("users, connections and volume_gb are not columns. The system wrote them out for "
                                        "you: use fixed_sql from now on.")
     return json.dumps(preview, default=str)
@@ -202,7 +203,7 @@ def _plan_from_text(text: str) -> dict | None:
 
 
 _MEASURE_SQL = {
-    "users": "uniqExactIf(subscriber_id, position(subscriber_id, '_') = 0)",
+    "users": "uniqCombined64If(subscriber_id, position(subscriber_id, '_') = 0)",
     "connections": "count()",
     "volume_gb": "round(sum(c2s_byte_num + s2c_byte_num) / 1e9, 2)",
     "unidentified_connections": "countIf(position(subscriber_id, '_') > 0)",
@@ -528,7 +529,7 @@ def measure_or_limit_mismatch(question: str, sql: str, turns: list[dict] | None 
                               "download: sum(s2c_byte_num))",
                     "connections": "connections: ORDER BY count() DESC",
                     "duration": "time: ORDER BY sum(duration) DESC",
-                    "users": "users: ORDER BY uniqExactIf(subscriber_id, position(subscriber_id, '_') = 0) DESC"}[asked[0]]
+                    "users": "users: ORDER BY uniqCombined64If(subscriber_id, position(subscriber_id, '_') = 0) DESC"}[asked[0]]
             problems.append(f"the question asks for the ranking by {want}, but the SQL orders by {first.strip()}")
     n = re.search(r"(?<![a-z])(?:top|first|pehle|ٹاپ)\s+(\d{1,4}|" + "|".join(_NUMBER_WORDS) + r")(?![a-z0-9])", q)
     lim = re.search(r"(?i)\bLIMIT\s+(\d+)\s*;?\s*$", s.strip())
@@ -578,7 +579,7 @@ def default_ranking_measure(question: str, sql: str, turns: list[dict] | None = 
     if _measure_kind(first) in (want, "") or (one_person and _measure_kind(first) == "users"):
         return None
     how = ("ORDER BY count() DESC (one subscriber: users is always 1)" if one_person else
-           "ORDER BY uniqExactIf(subscriber_id, position(subscriber_id, '_') = 0) DESC, count() DESC")
+           "ORDER BY uniqCombined64If(subscriber_id, position(subscriber_id, '_') = 0) DESC, count() DESC")
     return ("Not accepted yet: the question names no measure, so 'most used' follows the team's default: " + how +
             f". The SQL orders by {first.strip()}. Keep volume as an extra column if useful, fix the order, test, and "
             "submit again.")
@@ -646,7 +647,7 @@ def _default_overview(question: str, data_range: dict, steps: list, usage: dict,
     not_generic = ("\n  AND app_label NOT IN (" + ", ".join("'" + g.replace("'", "\\'") + "'" for g in generic) + ")"
                    if generic else "")
     tz = settings.timezone
-    sql = (f"SELECT app_label AS app,\n       uniqExactIf(subscriber_id, position(subscriber_id, '_') = 0) AS users,\n"
+    sql = (f"SELECT app_label AS app,\n       uniqCombined64If(subscriber_id, position(subscriber_id, '_') = 0) AS users,\n"
            f"       count() AS connections,\n       round(sum(c2s_byte_num + s2c_byte_num) / 1e9, 2) AS volume_gb\n"
            f"FROM {settings.full_table}\n"
            f"WHERE start_time >= toUnixTimestamp('{start.isoformat()} 00:00:00', '{tz}')\n"
@@ -665,7 +666,7 @@ def _default_overview(question: str, data_range: dict, steps: list, usage: dict,
             "status": "ok", "title": "Most used apps, last 7 days", "sql": sql,
             "explanation": "An overview, because the request named no app, place, period or measure. Ask about "
                            "anything more specific in your own words.",
-            "assumptions": [{"label": "Measure", "value": "Identified users, then connections"},
+            "assumptions": [{"label": "Measure", "value": "Identified users (ClickHouse uniqCombined64), then connections"},
                             {"label": "Excluded", "value": "background traffic"}],
             "chart": {"type": "bar", "x": "app", "y": "users", "series": ""}, "message": ""}
     return Answer(plan=align_period_text(plan, sql), sql=checked, result=result, steps=steps, usage=usage, tested=True)
@@ -749,6 +750,18 @@ def _app_rank_window(question: str, data_range: dict):
     from datetime import datetime, timedelta
 
     q = question.lower()
+    minute = re.search(r"\b(?:last|past|previous)\s+(\d+)\s*(?:minutes?|mins?|min)\b", q)
+    if minute:
+        n = int(minute.group(1))
+        if not 1 <= n <= 24 * 60:
+            return None
+        try:
+            end = datetime.fromisoformat(str(data_range.get("last") or "")[:19])
+        except ValueError:
+            return None
+        start = end - timedelta(minutes=n)
+        label = f"the last {n} minute" + ("s" if n != 1 else "")
+        return start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S"), label, True
     hour = re.search(r"\b(?:last|past|previous)\s+(\d+)\s*(?:hours?|hrs?)\b", q)
     if hour or re.search(r"\b(?:last|past)\s+hour\b", q):
         n = int(hour.group(1)) if hour else 1
@@ -797,7 +810,7 @@ def _direct_app_ranking(question: str, data_range: dict, step: StepFn) -> Answer
     upper = "<=" if hours else "<"
     tz = settings.timezone
     sql = (f"SELECT app_label AS app,\n"
-           f"       uniqExactIf(subscriber_id, position(subscriber_id, '_') = 0) AS users,\n"
+           f"       uniqCombined64If(subscriber_id, position(subscriber_id, '_') = 0) AS users,\n"
            f"       count() AS connections,\n"
            f"       round(sum(c2s_byte_num + s2c_byte_num) / 1e9, 2) AS volume_gb\n"
            f"FROM {settings.full_table}\n"
@@ -816,7 +829,7 @@ def _direct_app_ranking(question: str, data_range: dict, step: StepFn) -> Answer
     plan = {"understood": f"Top {limit} apps{where}, {label}.",
             "status": "ok", "title": f"Top {limit} apps{where}", "sql": sql,
             "explanation": f"Ranked by identified users over {label}.",
-            "assumptions": [{"label": "Measure", "value": "Identified users, then connections"},
+            "assumptions": [{"label": "Measure", "value": "Identified users (ClickHouse uniqCombined64), then connections"},
                             {"label": "Excluded", "value": "background traffic"}],
             "chart": {"type": "bar", "x": "app", "y": "users", "series": ""}, "message": ""}
     return Answer(plan=align_period_text(plan, sql), sql=checked, result=result,
@@ -1529,7 +1542,7 @@ def _answer_with_fallback(fallback, model_plan: dict, steps: list, usage: dict, 
                         "connections. Produced by the system's standard ranking, because the AI did not complete this "
                         "question."),
         "assumptions": [{"label": "Group", "value": f"{name}: {', '.join(c['labels'][:8])}{'…' if len(c['labels']) > 8 else ''}"},
-                        {"label": "Measure", "value": "Identified users, then connections"}]
+                        {"label": "Measure", "value": "Identified users (ClickHouse uniqCombined64), then connections"}]
                        + ([{"label": "Area", "value": f"{city} (city level)"}] if city else []),
         "chart": {"type": "bar", "x": "app", "y": "users", "series": ""},
         "message": "",
@@ -1653,7 +1666,7 @@ def rows_counted_as_people(question: str, sql: str) -> str | None:
     return ("Not accepted yet: the question asks how many PEOPLE, but count() / countIf() counts connections (rows). "
             "Count people (for a split, uniqExactIf(subscriber_id, <condition> AND position(subscriber_id, '_') = 0) per "
             "part, or GROUP BY the part) "
-            "with uniqExactIf(subscriber_id, position(subscriber_id, '_') = 0) AS users (or, for given subscribers, "
+            "with uniqCombined64If(subscriber_id, position(subscriber_id, '_') = 0) AS users (or, for given subscribers, "
             "uniq(subscriber_id)), keep every filter, test, and submit again.")
 
 
@@ -2015,7 +2028,7 @@ _AVERAGE = re.compile(r"(?<![a-z])(average|avg|the mean|mean value|mean of|ausat
 
 def average_formula(question: str) -> str:
     q = (question or "").lower()
-    users = "uniqExactIf(subscriber_id, position(subscriber_id, '_') = 0)"
+    users = "uniqCombined64If(subscriber_id, position(subscriber_id, '_') = 0)"
     if re.search(r"(?<![a-z])(time|duration|watch|hours|minutes|kitni der|spend|spent)(?![a-z])", q):
         what, unit = "sumIf(duration, position(subscriber_id, '_') = 0)", (" / 6e4 AS minutes_per_user" if "minute" in q
                                                                            else " / 3.6e6 AS hours_per_user")
@@ -2251,18 +2264,19 @@ _RAW_USER_COUNT = re.compile(r"\b(?:count\s*\(\s*DISTINCT\s+subscriber_id\s*\)|u
 
 
 def fix_user_count(sql: str) -> str | None:
+    """Use ClickHouse's fixed-size distinct count. uniqExact does not finish on multi-day ranges."""
     orig = sql or ""
     s = re.sub(r"(?i)\b(subscriber_id)\s+NOT\s+I?LIKE\s+'%_%'", r"position(\1, '_') = 0", orig)
     s = re.sub(r"(?i)\b(subscriber_id)\s+I?LIKE\s+'%_%'", r"position(\1, '_') > 0", s)
-    s = re.sub(r"\buniq(?:Combined|HLL12|Theta)?If\s*\(\s*subscriber_id\s*,", "uniqExactIf(subscriber_id,", s)
+    s = re.sub(r"(?i)\buniqExactIf\s*\(\s*subscriber_id\s*,", "uniqCombined64If(subscriber_id,", s)
     s = re.sub(r"(?i)\bcount\s*\(\s*subscriber_id\s*\)(?!\s+AS\s+\w*(connection|hit|record|row|time|visit|session|request))",
-               "uniqExact(subscriber_id)", s)
+               "uniqCombined64(subscriber_id)", s)
     if not _RAW_USER_COUNT.search(s):
         return s if s != orig else None
     if re.search(r"position\(\s*subscriber_id\s*,\s*'_'\s*\)\s*=\s*0|subscriber_id\s*(IN\s*\(|=\s*')", s, re.I):
-        s = re.sub(r"\buniq(?:Combined|HLL12|Theta)?\s*\(\s*subscriber_id\s*\)", "uniqExact(subscriber_id)", s)
+        s = re.sub(r"(?i)\buniq(?:Exact|Combined|HLL12|Theta)?\s*\(\s*subscriber_id\s*\)", "uniqCombined64(subscriber_id)", s)
         return s if s != orig else None
-    return _RAW_USER_COUNT.sub("uniqExactIf(subscriber_id, position(subscriber_id, '_') = 0)", s)
+    return _RAW_USER_COUNT.sub("uniqCombined64If(subscriber_id, position(subscriber_id, '_') = 0)", s)
 
 
 def fix_limit_one(sql: str, question: str = "") -> str | None:

@@ -309,7 +309,7 @@ def ranking_sql(key: str, start: str, end_exclusive: str, city: str | None = Non
     match_ = f"(app_label IN {sql_list(key)}" + (f" OR match(requested_server, '{c['hosts']}'))" if c["hosts"] else ")")
     where_city = f"\n  AND client_location = '{city} Pakistan'" if city else ""
     return (f"SELECT {app} AS app,\n"
-            f"       uniqExactIf(subscriber_id, position(subscriber_id, '_') = 0) AS users,\n"
+            f"       uniqCombined64If(subscriber_id, position(subscriber_id, '_') = 0) AS users,\n"
             f"       count() AS connections,\n"
             f"       round(sum(c2s_byte_num + s2c_byte_num) / 1e9, 2) AS volume_gb\n"
             f"FROM {table}\n"
@@ -326,7 +326,7 @@ def total_sql(key: str, start: str, end_exclusive: str, city: str | None = None,
     match_ = f"(app_label IN {sql_list(key)}" + (f" OR match(requested_server, '{c['hosts']}'))" if c["hosts"] else ")")
     where_city = f"\n  AND client_location = '{city} Pakistan'" if city else ""
     return (f"SELECT '{name}' AS app_group,\n"
-            f"       uniqExactIf(subscriber_id, position(subscriber_id, '_') = 0) AS users,\n"
+            f"       uniqCombined64If(subscriber_id, position(subscriber_id, '_') = 0) AS users,\n"
             f"       count() AS connections,\n"
             f"       round(sum(c2s_byte_num + s2c_byte_num) / 1e9, 2) AS volume_gb\n"
             f"FROM {table}\n"
