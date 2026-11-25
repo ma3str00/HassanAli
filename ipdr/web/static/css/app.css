@@ -241,8 +241,8 @@ body:not(.route-chat) .sidebar { display: none; }
 .answer-meta .steps-toggle { margin-left: auto; }
 .answer h3 { font-size: 17px; margin-top: 6px; }
 .steps { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 3px; font-size: 13px; color: var(--ink-3); }
-.steps li { display: flex; align-items: center; gap: 8px; }
-.steps li::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--axis); flex: none; }
+.steps li { display: flex; align-items: flex-start; gap: 8px; white-space: pre-wrap; min-width: 0; }
+.steps li::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--axis); flex: none; margin-top: 6px; }
 .steps li.now { color: var(--ink-1); }
 .steps li.now::before { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: 0.25; } }

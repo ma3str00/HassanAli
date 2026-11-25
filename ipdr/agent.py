@@ -819,12 +819,13 @@ def _direct_app_ranking(question: str, data_range: dict, step: StepFn) -> Answer
            f"{where_city}{not_generic}\n"
            f"GROUP BY app\nORDER BY users DESC, connections DESC\nLIMIT {limit}")
     step("Reading the question")
-    step("Running the query")
+    ran = sql
     try:
-        checked = sql_guard.check(sql)
-        result = db.cached_query(checked, timeout=180)
+        ran = sql_guard.check(sql)
+        step(ran)
+        result = db.cached_query(ran, timeout=180)
     except (sql_guard.GuardError, QueryError) as e:
-        raise AgentError(str(e)) from e
+        raise AgentError(f"{e}\n\n{ran}") from e
     where = f" in {city}" if city else ""
     plan = {"understood": f"Top {limit} apps{where}, {label}.",
             "status": "ok", "title": f"Top {limit} apps{where}", "sql": sql,
@@ -832,8 +833,8 @@ def _direct_app_ranking(question: str, data_range: dict, step: StepFn) -> Answer
             "assumptions": [{"label": "Measure", "value": "Identified users (ClickHouse uniqCombined64), then connections"},
                             {"label": "Excluded", "value": "background traffic"}],
             "chart": {"type": "bar", "x": "app", "y": "users", "series": ""}, "message": ""}
-    return Answer(plan=align_period_text(plan, sql), sql=checked, result=result,
-                  steps=["Reading the question", "Running the query"], tested=True)
+    return Answer(plan=align_period_text(plan, sql), sql=ran, result=result,
+                  steps=["Reading the question", ran], tested=True)
 
 
 def answer(question: str, turns: list[dict], cfg: LLMConfig, data_range: dict,
